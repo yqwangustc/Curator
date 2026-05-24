@@ -12,32 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure-helper unit tests for `audio.alm.pretrain.stages`.
+"""Pure-helper unit tests for the pretrain pipeline.
 
 No Curator stage machinery, no soundfile / torch.  These tests cover the
-algorithm code that the stages call into.
+algorithm helpers that the stages in ``planning`` / ``utils`` /
+``finalize`` call into.
 """
 
 from __future__ import annotations
 
-import os
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
-from nemo_curator.stages.audio.alm.pretrain.stages import (
-    _build_final_summary,
+from nemo_curator.stages.audio.alm.pretrain.finalize import _build_final_summary
+from nemo_curator.stages.audio.alm.pretrain.planning import (
+    _count_ngrams,
+    _find_offending_ngrams,
+    _format_red,
+    _locate_ngram_char_ranges,
+    _merge_char_ranges,
+    filter_empty_segments,
+    find_overlapping_indices,
+    plan_snippets,
+    relativize_segments,
+)
+from nemo_curator.stages.audio.alm.pretrain.utils import (
     _delete_shards,
     _glob_shards,
     _make_shard_path,
     _resolve_audio_path,
     _segment_text,
-    filter_empty_segments,
-    find_overlapping_indices,
     histogram_30s,
     make_snippet_id,
-    plan_snippets,
-    relativize_segments,
 )
 
 # ----------------------------------------------------------------------
@@ -46,19 +54,22 @@ from nemo_curator.stages.audio.alm.pretrain.stages import (
 
 
 class TestSegmentText:
-    def test_prefers_text_itn_when_set(self) -> None:
-        seg = {"text": "hello", "text_ITN": "Hello."}
-        assert _segment_text(seg) == "Hello."
-
-    def test_falls_back_to_text_when_itn_empty(self) -> None:
-        seg = {"text": "hello", "text_ITN": ""}
-        assert _segment_text(seg) == "hello"
-
-    def test_returns_empty_when_both_missing(self) -> None:
-        assert _segment_text({}) == ""
+    def test_returns_text_field(self) -> None:
+        assert _segment_text({"text": "hello"}) == "hello"
 
     def test_strips_whitespace(self) -> None:
-        assert _segment_text({"text_ITN": "  hi  "}) == "hi"
+        assert _segment_text({"text": "  hi  "}) == "hi"
+
+    def test_returns_empty_when_text_missing(self) -> None:
+        assert _segment_text({}) == ""
+
+    def test_returns_empty_when_text_empty(self) -> None:
+        assert _segment_text({"text": ""}) == ""
+
+    def test_ignores_text_itn(self) -> None:
+        # text_ITN is unreliable in real upstream data; the helper only reads `text`.
+        assert _segment_text({"text": "", "text_ITN": "ignored"}) == ""
+        assert _segment_text({"text": "kept", "text_ITN": "Other."}) == "kept"
 
 
 # ----------------------------------------------------------------------
@@ -139,6 +150,34 @@ class TestFindOverlappingIndices:
         segs = [_seg(10, 12), _seg(0, 5), _seg(4, 8)]
         # Indices 1 and 2 overlap (1.0s); index 0 is fine
         assert find_overlapping_indices(segs, 0.5) == {1, 2}
+
+    def test_empty_input(self) -> None:
+        assert find_overlapping_indices([], 0.5) == set()
+
+    def test_single_segment(self) -> None:
+        assert find_overlapping_indices([_seg(0, 5)], 0.5) == set()
+
+    def test_identical_intervals(self) -> None:
+        # Sweep-line + heap edge case: equal start AND end. Both should
+        # be flagged via containment (each "contains" the other).
+        segs = [_seg(0, 5), _seg(0, 5)]
+        assert find_overlapping_indices(segs, 0.5) == {0, 1}
+
+    def test_long_non_overlapping_chain(self) -> None:
+        # 200 strictly non-overlapping intervals. With the old O(n^2) pair
+        # scan this is ~20k comparisons; with the sweep-line each new
+        # interval finds the heap empty after eviction, so the inner loop
+        # is never entered. Asserts the result is empty regardless.
+        segs = [_seg(i * 2.0, i * 2.0 + 1.0) for i in range(200)]
+        assert find_overlapping_indices(segs, 0.5) == set()
+
+    def test_two_speakers_alternating_overlap(self) -> None:
+        # Simulate two interleaved speakers (A: 0-5, B: 4-9, A: 8-13,
+        # B: 12-17). Adjacent pairs overlap by 1.0s; far pairs don't.
+        # Sweep-line must evict the trailing A/B from the heap as the
+        # cursor moves forward so the active set stays bounded.
+        segs = [_seg(0, 5), _seg(4, 9), _seg(8, 13), _seg(12, 17)]
+        assert find_overlapping_indices(segs, 0.5) == {0, 1, 2, 3}
 
 
 # ----------------------------------------------------------------------
@@ -319,6 +358,32 @@ class TestMakeSnippetId:
         assert "." not in sid
         assert sid == "source-id_with-dashes-3101_250-3109_940"
 
+    def test_dots_in_original_id_are_sanitized(self) -> None:
+        # Input manifests sometimes carry an id like a source filename
+        # ("meeting.wav") or a versioned id ("session.1.2"). Those dots
+        # would otherwise survive into the snippet id and break the same
+        # WebDataset contract as dotted timestamps.
+        sid = make_snippet_id("meeting.wav", 0.0, 30.0)
+        assert "." not in sid
+        assert sid == "meeting_wav-0_000-30_000"
+
+        sid = make_snippet_id("session.1.2", 1.0, 2.5)
+        assert "." not in sid
+        assert sid == "session_1_2-1_000-2_500"
+
+    def test_path_separators_in_original_id_are_sanitized(self) -> None:
+        # Path-like ids would otherwise turn `<snippet_id>.<ext>` into a
+        # nested tar path, breaking the "members live at the tar root"
+        # contract.  Both POSIX and Windows separators are stripped so the
+        # output stays portable.
+        sid = make_snippet_id("shard1/utt001", 0.0, 5.0)
+        assert "/" not in sid and "\\" not in sid
+        assert sid == "shard1_utt001-0_000-5_000"
+
+        sid = make_snippet_id("dirA\\sub\\utt", 1.0, 2.0)
+        assert "/" not in sid and "\\" not in sid
+        assert sid == "dirA_sub_utt-1_000-2_000"
+
 
 # ----------------------------------------------------------------------
 # histogram_30s
@@ -356,6 +421,31 @@ class TestResolveAudioPath:
 
     def test_simple_basename(self) -> None:
         assert _resolve_audio_path("/data", "baz.flac") == "/data/baz.flac"
+
+    def test_relative_mode_preserves_subdirectories(self) -> None:
+        # 'relative' joins audio_dir / value verbatim, so a manifest that
+        # carries a relative sub-path stays under that sub-path on disk.
+        assert (
+            _resolve_audio_path("/data", "shard1/foo.wav", "relative") == "/data/shard1/foo.wav"
+        )
+
+    def test_relative_mode_absolute_value_wins(self) -> None:
+        # os.path.join semantics: an absolute right-hand side discards the
+        # left-hand side. Documented in the docstring as the way 'relative'
+        # mode handles absolute manifest paths.
+        assert (
+            _resolve_audio_path("/data", "/elsewhere/bar.wav", "relative") == "/elsewhere/bar.wav"
+        )
+
+    def test_as_is_mode_returns_value_unchanged(self) -> None:
+        assert (
+            _resolve_audio_path("/data", "/elsewhere/bar.wav", "as_is") == "/elsewhere/bar.wav"
+        )
+        assert _resolve_audio_path("/data", "rel/foo.wav", "as_is") == "rel/foo.wav"
+
+    def test_unknown_mode_raises(self) -> None:
+        with pytest.raises(ValueError, match="unknown audio_path_resolution"):
+            _resolve_audio_path("/data", "foo.wav", "not_a_mode")
 
 
 # ----------------------------------------------------------------------
@@ -438,12 +528,82 @@ class TestBuildFinalSummary:
 
 
 # ----------------------------------------------------------------------
-# Sanity: ensure no test wrote outside tmp_path
+# Repetition-filter helpers
 # ----------------------------------------------------------------------
 
 
-def test_module_is_importable() -> None:
-    """Sanity check: the module imports without side effects."""
-    import nemo_curator.stages.audio.alm.pretrain.stages as m
+class TestCountNgrams:
+    def test_counts_overlapping_windows(self) -> None:
+        # [1,2,3] repeated three times -> 3-gram (1,2,3) appears 3 times
+        c = _count_ngrams([1, 2, 3, 1, 2, 3, 1, 2, 3], 3)
+        assert c[(1, 2, 3)] == 3
+        # 2-gram across the boundary: (3,1) appears twice
+        c2 = _count_ngrams([1, 2, 3, 1, 2, 3, 1, 2, 3], 2)
+        assert c2[(1, 2)] == 3
+        assert c2[(3, 1)] == 2
 
-    assert os.path.basename(m.__file__) == "stages.py"
+    def test_returns_empty_when_too_short(self) -> None:
+        assert _count_ngrams([1, 2], 4) == Counter()
+        assert _count_ngrams([], 2) == Counter()
+
+    def test_returns_empty_when_n_invalid(self) -> None:
+        assert _count_ngrams([1, 2, 3], 0) == Counter()
+        assert _count_ngrams([1, 2, 3], -1) == Counter()
+
+
+class TestFindOffendingNgrams:
+    def test_strict_inequality(self) -> None:
+        c = Counter({(1, 2): 3, (3, 4): 4, (5, 6): 5})
+        # max_count=3 -> only counts > 3 are offending
+        assert _find_offending_ngrams(c, 3) == {(3, 4), (5, 6)}
+
+    def test_empty_when_none_exceed(self) -> None:
+        c = Counter({(1, 2): 3, (3, 4): 1})
+        assert _find_offending_ngrams(c, 3) == set()
+
+
+class TestLocateNgramCharRanges:
+    def test_locates_every_occurrence(self) -> None:
+        # Three repetitions of 3-gram (1,2,3) at non-touching offsets
+        toks = [1, 2, 3, 1, 2, 3, 1, 2, 3]
+        offs = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (16, 17)]
+        ranges = _locate_ngram_char_ranges(toks, offs, {(1, 2, 3)}, 3)
+        assert ranges == [(0, 5), (6, 11), (12, 17)]
+
+    def test_empty_when_no_offending(self) -> None:
+        assert _locate_ngram_char_ranges([1, 2, 3], [(0, 1), (2, 3), (4, 5)], set(), 2) == []
+
+    def test_empty_when_too_short(self) -> None:
+        assert _locate_ngram_char_ranges([1], [(0, 1)], {(1, 2)}, 2) == []
+
+
+class TestMergeCharRanges:
+    def test_merges_overlapping(self) -> None:
+        assert _merge_char_ranges([(0, 5), (3, 8), (10, 15)]) == [(0, 8), (10, 15)]
+
+    def test_sorts_input(self) -> None:
+        assert _merge_char_ranges([(10, 15), (0, 5)]) == [(0, 5), (10, 15)]
+
+    def test_merges_touching(self) -> None:
+        assert _merge_char_ranges([(0, 5), (5, 10)]) == [(0, 10)]
+
+    def test_empty(self) -> None:
+        assert _merge_char_ranges([]) == []
+
+
+class TestFormatRed:
+    def test_wraps_single_range(self) -> None:
+        assert _format_red("hello world", [(0, 5)]) == "<red>hello</red> world"
+
+    def test_no_ranges_returns_text(self) -> None:
+        assert _format_red("hello world", []) == "hello world"
+
+    def test_escapes_lt_in_plain_text(self) -> None:
+        assert _format_red("a<b>c", []) == r"a\<b>c"
+
+    def test_escapes_lt_inside_highlighted(self) -> None:
+        # "<" inside a highlighted span must be escaped too so loguru doesn't try to parse it.
+        assert _format_red("<x>", [(0, 3)]) == r"<red>\<x></red>"
+
+    def test_multiple_ranges(self) -> None:
+        assert _format_red("aaa bbb ccc", [(0, 3), (8, 11)]) == "<red>aaa</red> bbb <red>ccc</red>"
