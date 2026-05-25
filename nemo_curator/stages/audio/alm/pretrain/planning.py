@@ -47,6 +47,23 @@ from nemo_curator.tasks import AudioTask
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
+DEFAULT_NO_SPEAKER_LABELS = (
+    "no-speaker",
+    "no_speaker",
+    "no speaker",
+    "nospeaker",
+    "non-speaker",
+    "non_speaker",
+    "non speaker",
+    "nonspeaker",
+    "non-speech",
+    "non_speech",
+    "non speech",
+    "nonspeech",
+    "silence",
+)
+_MIN_SEGMENTS_FOR_OVERLAP_CHECK = 2
+
 
 # ----------------------------------------------------------------------
 # Pure helpers (unit-testable without Ray / soundfile)
@@ -89,7 +106,7 @@ def find_overlapping_indices(segments: list[dict], min_overlap_sec: float) -> se
     is dense in that case.
     """
     n = len(segments)
-    if n < 2:
+    if n < _MIN_SEGMENTS_FOR_OVERLAP_CHECK:
         return set()
     # Sort indirectly so we can return indices into the caller's list.
     order = sorted(
@@ -121,6 +138,30 @@ def find_overlapping_indices(segments: list[dict], min_overlap_sec: float) -> se
                 bad.add(j)
         heapq.heappush(active, (ei, si, k))
     return bad
+
+
+def _finalize_snippet_candidates(
+    candidates: list[dict],
+    max_duration_sec: float,
+    min_duration_sec: float,
+) -> tuple[list[dict], dict[str, int]]:
+    """Apply shared duration/text filters to snippet candidates."""
+    drop_counts = {"too_long": 0, "too_short": 0, "no_text": 0}
+    snippets: list[dict] = []
+    for cand in candidates:
+        duration = cand["end"] - cand["start"]
+        if duration > max_duration_sec:
+            drop_counts["too_long"] += 1
+            continue
+        if duration < min_duration_sec:
+            drop_counts["too_short"] += 1
+            continue
+        text = " ".join(_segment_text(s) for s in cand["segments"]).strip()
+        if not text:
+            drop_counts["no_text"] += 1
+            continue
+        snippets.append(cand)
+    return snippets, drop_counts
 
 
 def plan_snippets(
@@ -161,9 +202,8 @@ def plan_snippets(
     ``gap`` becomes negative and the gap constraint is silently bypassed,
     grouping content that should belong to separate snippets.
     """
-    drop_counts = {"too_long": 0, "too_short": 0, "no_text": 0}
     if not segments:
-        return [], drop_counts
+        return [], {"too_long": 0, "too_short": 0, "no_text": 0}
 
     candidates: list[dict] = []
     cur: dict | None = None
@@ -183,20 +223,82 @@ def plan_snippets(
     if cur is not None:
         candidates.append(cur)
 
-    snippets: list[dict] = []
-    for cand in candidates:
-        duration = cand["end"] - cand["start"]
-        if duration > max_duration_sec:
-            drop_counts["too_long"] += 1
+    return _finalize_snippet_candidates(candidates, max_duration_sec, min_duration_sec)
+
+
+def normalize_speaker_label(label: object) -> str:
+    """Normalize a speaker label for no-speaker comparisons."""
+    if label is None:
+        return ""
+    normalized = str(label).strip().lower().replace("_", " ").replace("-", " ")
+    return "-".join(normalized.split())
+
+
+def is_no_speaker_label(
+    label: object,
+    no_speaker_labels: tuple[str, ...] = DEFAULT_NO_SPEAKER_LABELS,
+) -> bool:
+    """Return True when ``label`` denotes a no-speaker / silence segment."""
+    normalized_labels = {normalize_speaker_label(x) for x in no_speaker_labels}
+    return normalize_speaker_label(label) in normalized_labels
+
+
+def is_no_speaker_segment(
+    segment: dict,
+    no_speaker_labels: tuple[str, ...] = DEFAULT_NO_SPEAKER_LABELS,
+) -> bool:
+    """Return True when a segment's speaker label is no-speaker-like."""
+    return is_no_speaker_label(segment.get("speaker"), no_speaker_labels)
+
+
+def plan_no_speaker_snippets(
+    segments: list[dict],
+    max_duration_sec: float,
+    min_duration_sec: float,
+    no_speaker_labels: tuple[str, ...] = DEFAULT_NO_SPEAKER_LABELS,
+) -> tuple[list[dict], dict[str, int]]:
+    """Pack consecutive non-no-speaker segments into snippets.
+
+    Walks segments in timestamp order. A no-speaker-like segment closes
+    the current snippet and is never included in output. Consecutive
+    non-no-speaker segments are grouped until either a no-speaker segment
+    is seen or adding the next segment would exceed ``max_duration_sec``.
+
+    Returns ``(snippets, drop_counts)`` where drop counts include
+    ``no_speaker`` plus the shared ``too_long``, ``too_short``, and
+    ``no_text`` filters.
+    """
+    drop_counts = {"no_speaker": 0, "too_long": 0, "too_short": 0, "no_text": 0}
+    if not segments:
+        return [], drop_counts
+
+    candidates: list[dict] = []
+    cur: dict | None = None
+    for seg in sorted(segments, key=lambda s: (s["start"], s["end"])):
+        if is_no_speaker_segment(seg, no_speaker_labels):
+            drop_counts["no_speaker"] += 1
+            if cur is not None:
+                candidates.append(cur)
+                cur = None
             continue
-        if duration < min_duration_sec:
-            drop_counts["too_short"] += 1
+
+        if cur is None:
+            cur = {"start": seg["start"], "end": seg["end"], "segments": [seg]}
             continue
-        text = " ".join(_segment_text(s) for s in cand["segments"]).strip()
-        if not text:
-            drop_counts["no_text"] += 1
-            continue
-        snippets.append(cand)
+
+        new_end = max(cur["end"], seg["end"])
+        if new_end - cur["start"] <= max_duration_sec:
+            cur["end"] = new_end
+            cur["segments"].append(seg)
+        else:
+            candidates.append(cur)
+            cur = {"start": seg["start"], "end": seg["end"], "segments": [seg]}
+
+    if cur is not None:
+        candidates.append(cur)
+
+    snippets, shared_drops = _finalize_snippet_candidates(candidates, max_duration_sec, min_duration_sec)
+    drop_counts.update(shared_drops)
     return snippets, drop_counts
 
 
@@ -459,6 +561,89 @@ class SnippetCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
         self._log_metrics(
             {
                 "plan_time": time.perf_counter() - t0,
+                "planned_snippets": float(len(snippets)),
+                "dropped_too_long": float(drop_counts["too_long"]),
+                "dropped_too_short": float(drop_counts["too_short"]),
+                "dropped_no_text": float(drop_counts["no_text"]),
+            }
+        )
+        if not snippets:
+            logger.warning(f"[{self.name}] {task.task_id}: planner produced 0 snippets (drop counts={drop_counts})")
+        return task
+
+
+@dataclass
+class NoSpeakerCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
+    """Compute snippets that never include no-speaker-like segments.
+
+    Pure planning -- no audio I/O.  Produces the same ``_snippet_plan``
+    shape as :class:`SnippetCutPlannerStage`, allowing the no-speaker
+    cut pipeline to reuse the existing extractor, manifest writer, tar
+    merger, and metrics aggregator.
+    """
+
+    max_duration_sec: float = 600.0
+    min_duration_sec: float = 0.5
+    no_speaker_labels: tuple[str, ...] = DEFAULT_NO_SPEAKER_LABELS
+
+    name: str = "NoSpeakerCutPlanner"
+    batch_size: int = 1
+    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
+
+    def __post_init__(self) -> None:
+        if self.max_duration_sec <= 0:
+            msg = "max_duration_sec must be > 0"
+            raise ValueError(msg)
+        if self.min_duration_sec < 0:
+            msg = "min_duration_sec must be >= 0"
+            raise ValueError(msg)
+        if self.min_duration_sec > self.max_duration_sec:
+            msg = "min_duration_sec must be <= max_duration_sec"
+            raise ValueError(msg)
+        if not self.no_speaker_labels:
+            msg = "no_speaker_labels must not be empty"
+            raise ValueError(msg)
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return [], ["segments"]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return [], [_PLAN_DATA_KEY]
+
+    def process(self, task: AudioTask) -> AudioTask:
+        t0 = time.perf_counter()
+        segments = list(task.data.get("segments") or [])
+        original_count = len(segments)
+        original_duration = (
+            max(s["end"] for s in segments) - min(s["start"] for s in segments) if segments else 0.0
+        )
+
+        snippets, drop_counts = plan_no_speaker_snippets(
+            segments,
+            self.max_duration_sec,
+            self.min_duration_sec,
+            self.no_speaker_labels,
+        )
+        task.data[_PLAN_DATA_KEY] = snippets
+
+        meta = task._metadata.setdefault(_PRETRAIN_META_KEY, {})
+        meta["original_seg_count"] = original_count
+        meta["original_seg_duration"] = float(original_duration)
+        meta["dropped_empty"] = 0
+        meta["dropped_overlap"] = 0
+        meta["dropped_no_speaker"] = drop_counts["no_speaker"]
+        meta["dropped_too_long"] = drop_counts["too_long"]
+        meta["dropped_too_short"] = drop_counts["too_short"]
+        meta["dropped_no_text"] = drop_counts["no_text"]
+        meta["dropped_repetition"] = 0
+        meta["kept_after_filter_count"] = original_count - drop_counts["no_speaker"]
+        meta["planned_snippets"] = len(snippets)
+
+        self._log_metrics(
+            {
+                "plan_time": time.perf_counter() - t0,
+                "input_segments": float(original_count),
+                "dropped_no_speaker": float(drop_counts["no_speaker"]),
                 "planned_snippets": float(len(snippets)),
                 "dropped_too_long": float(drop_counts["too_long"]),
                 "dropped_too_short": float(drop_counts["too_short"]),

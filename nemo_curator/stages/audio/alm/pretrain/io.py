@@ -119,7 +119,7 @@ class ReadLongFormManifestStage(ProcessingStage[_EmptyTask, AudioTask]):
     def xenna_stage_spec(self) -> dict[str, Any]:
         return {"num_workers": 1}
 
-    def process(self, _: _EmptyTask) -> list[AudioTask]:
+    def process(self, _: _EmptyTask) -> list[AudioTask]:  # noqa: C901
         t0 = time.perf_counter()
         if self.audio_path_resolution not in _AUDIO_PATH_RESOLUTION_MODES:
             msg = (
@@ -286,6 +286,8 @@ class PretrainMetricsAggregatorStage(ProcessingStage[AudioTask, AudioTask]):
     * ``in_segments``, ``in_duration_sec``, ``dropped`` -- per-original
       input-side counters; written on every record (identical across
       records for the same original); the merger keeps the first.
+      ``dropped`` can include planner-specific reasons such as
+      ``no_speaker``.
     * ``is_stub`` -- True iff this is the extractor's zero-snippet stub.
     * ``out_segments``, ``out_duration_sec`` -- this snippet's
       contribution; zero for stubs.
@@ -338,18 +340,21 @@ class PretrainMetricsAggregatorStage(ProcessingStage[AudioTask, AudioTask]):
             return task
         meta = task._metadata.get(_PRETRAIN_META_KEY, {})
         is_stub = _is_origin_stub(task)
+        dropped = {
+            "empty": int(meta.get("dropped_empty", 0)),
+            "overlap": int(meta.get("dropped_overlap", 0)),
+            "too_long": int(meta.get("dropped_too_long", 0)),
+            "too_short": int(meta.get("dropped_too_short", 0)),
+            "no_text": int(meta.get("dropped_no_text", 0)),
+            "repetition": int(meta.get("dropped_repetition", 0)),
+        }
+        if "dropped_no_speaker" in meta:
+            dropped["no_speaker"] = int(meta.get("dropped_no_speaker", 0))
         record: dict[str, Any] = {
             "id": original_id,
             "in_segments": int(meta.get("original_seg_count", 0)),
             "in_duration_sec": float(meta.get("original_seg_duration", 0.0)),
-            "dropped": {
-                "empty": int(meta.get("dropped_empty", 0)),
-                "overlap": int(meta.get("dropped_overlap", 0)),
-                "too_long": int(meta.get("dropped_too_long", 0)),
-                "too_short": int(meta.get("dropped_too_short", 0)),
-                "no_text": int(meta.get("dropped_no_text", 0)),
-                "repetition": int(meta.get("dropped_repetition", 0)),
-            },
+            "dropped": dropped,
             "is_stub": is_stub,
             "out_segments": 0 if is_stub else len(task.data.get("segments") or []),
             "out_duration_sec": 0.0 if is_stub else float(task.data.get("duration", 0.0)),

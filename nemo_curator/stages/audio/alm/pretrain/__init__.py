@@ -36,15 +36,18 @@ from nemo_curator.stages.audio.alm.pretrain.io import (
     SnippetManifestWriterStage,
 )
 from nemo_curator.stages.audio.alm.pretrain.pipeline import (
+    build_audio_no_speaker_cut_pipeline,
     build_audio_pretrain_pipeline,
 )
 from nemo_curator.stages.audio.alm.pretrain.planning import (
+    NoSpeakerCutPlannerStage,
     OverlapFilterStage,
     SnippetCutPlannerStage,
     SnippetRepetitionFilterStage,
 )
 
 __all__ = [
+    "NoSpeakerCutPlannerStage",
     "OverlapFilterStage",
     "PretrainMetricsAggregatorStage",
     "ReadLongFormManifestStage",
@@ -52,6 +55,7 @@ __all__ = [
     "SnippetExtractionStage",
     "SnippetManifestWriterStage",
     "SnippetRepetitionFilterStage",
+    "build_audio_no_speaker_cut_pipeline",
     "build_audio_pretrain_pipeline",
     "finalize_audio_pretrain_outputs",
     "prepare_audio_pretrain_outputs",

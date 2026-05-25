@@ -53,6 +53,7 @@ from .io import (
     SnippetManifestWriterStage,
 )
 from .planning import (
+    NoSpeakerCutPlannerStage,
     OverlapFilterStage,
     SnippetCutPlannerStage,
     SnippetRepetitionFilterStage,
@@ -60,6 +61,7 @@ from .planning import (
 from .utils import AUDIO_PATH_RESOLUTION_BASENAME
 
 __all__ = [
+    "build_audio_no_speaker_cut_pipeline",
     "build_audio_pretrain_pipeline",
     "finalize_audio_pretrain_outputs",
     "prepare_audio_pretrain_outputs",
@@ -208,6 +210,66 @@ def build_audio_pretrain_pipeline(  # noqa: PLR0913
                 ngram_max_count=ngram_max_count,
                 cache_dir=tokenizer_cache_dir,
                 hf_token=hf_token,
+            ),
+            SnippetExtractionStage(
+                output_dir=output_dir,
+                output_audio_tar_path=output_audio_tar_path,
+                target_sample_rate=target_sample_rate,
+                output_format=output_format,
+                audio_filepath_key=audio_filepath_key,
+                dry_run=dry_run,
+            ),
+            SnippetManifestWriterStage(output_path=output_manifest_path),
+            PretrainMetricsAggregatorStage(output_path=metrics_path),
+        ],
+    )
+
+
+def build_audio_no_speaker_cut_pipeline(  # noqa: PLR0913
+    *,
+    input_manifest: str,
+    audio_dir: str,
+    output_dir: str,
+    output_manifest_path: str,
+    output_audio_tar_path: str,
+    metrics_path: str,
+    max_duration_sec: float,
+    min_duration_sec: float = 0.5,
+    target_sample_rate: int = 16000,
+    output_format: str = "flac",
+    audio_filepath_key: str = "audio_filepath",
+    audio_path_resolution: str = AUDIO_PATH_RESOLUTION_BASENAME,
+    dataset_name: str = "long_form_audio",
+    dry_run: bool = False,
+) -> Pipeline:
+    """Build a no-speaker-aware long-form-audio cutting pipeline.
+
+    This is a simplified cut flow that reuses the pretrain pipeline's
+    manifest reader, extraction/tar-writing stage, manifest writer,
+    metrics aggregator, and finalization helpers.  Its only planning
+    rule is to emit snippets made from consecutive non-no-speaker
+    segments; any segment labeled ``no-speaker`` or an obvious variant
+    closes the current snippet and is excluded from output.
+
+    ``max_duration_sec`` and ``min_duration_sec`` are enforced on the
+    resulting snippet candidates.  If a consecutive speech run exceeds
+    ``max_duration_sec``, it is split on segment boundaries without
+    crossing a no-speaker boundary.
+    """
+    return Pipeline(
+        name="audio_no_speaker_long_form_cut",
+        description=("Long-form audio -> snippets that exclude no-speaker segments"),
+        stages=[
+            ReadLongFormManifestStage(
+                input_manifest=input_manifest,
+                audio_dir=audio_dir,
+                audio_filepath_key=audio_filepath_key,
+                audio_path_resolution=audio_path_resolution,
+                dataset_name=dataset_name,
+            ),
+            NoSpeakerCutPlannerStage(
+                max_duration_sec=max_duration_sec,
+                min_duration_sec=min_duration_sec,
             ),
             SnippetExtractionStage(
                 output_dir=output_dir,
