@@ -235,6 +235,8 @@ def build_audio_no_speaker_cut_pipeline(  # noqa: PLR0913
     metrics_path: str,
     max_duration_sec: float,
     min_duration_sec: float = 0.5,
+    min_num_speaker: int = 1,
+    max_num_speaker: int | None = None,
     target_sample_rate: int = 16000,
     output_format: str = "flac",
     audio_filepath_key: str = "audio_filepath",
@@ -254,7 +256,9 @@ def build_audio_no_speaker_cut_pipeline(  # noqa: PLR0913
     ``max_duration_sec`` and ``min_duration_sec`` are enforced on the
     resulting snippet candidates.  If a consecutive speech run exceeds
     ``max_duration_sec``, it is split on segment boundaries without
-    crossing a no-speaker boundary.
+    crossing a no-speaker boundary.  ``min_num_speaker`` and
+    ``max_num_speaker`` filter the resulting snippets by unique speaker
+    labels; ``max_num_speaker=None`` leaves the upper bound disabled.
     """
     return Pipeline(
         name="audio_no_speaker_long_form_cut",
@@ -270,6 +274,8 @@ def build_audio_no_speaker_cut_pipeline(  # noqa: PLR0913
             NoSpeakerCutPlannerStage(
                 max_duration_sec=max_duration_sec,
                 min_duration_sec=min_duration_sec,
+                min_num_speaker=min_num_speaker,
+                max_num_speaker=max_num_speaker,
             ),
             SnippetExtractionStage(
                 output_dir=output_dir,

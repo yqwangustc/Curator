@@ -12,49 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLI runner for the long-form-audio ALM pretraining pipeline.
-
-An example to do dry-run:
-
-
-# Export the two workarounds for this session
-#    - prestart only 4 workers at a time, sidesteps issue #40131
-#    - bump the state-API list cap so Xenna's monitor (limit=40000) doesn't trip
-export RAY_worker_maximum_startup_concurrency=4
-export RAY_MAX_LIMIT_FROM_API_SERVER=50000
-
-.venv/bin/python -m tutorials.audio.audio_pretrain.run \
-      --input-manifest test.jsonl \
-      --audio-dir /tmp \
-      --output-dir /tmp/dryrun_unused \
-      --output-manifest /tmp/test_dryrun.jsonl \
-      --output-audio-tar-path /tmp/test_dryrun.tar \
-      --metrics-path /tmp/test_metrics.json \
-      --tokenizer-path /path/to/hf_tokenizer_dir \
-      --max-duration-sec 900 \
-      --dry-run
-
-"""
+"""CLI runner for diarization-aware long-form audio cutting."""
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import os
 import sys
 import time
 
 from loguru import logger
 
+from nemo_curator.backends.ray_data.executor import RayDataExecutor
+from nemo_curator.backends.xenna.executor import XennaExecutor
 from nemo_curator.stages.audio.alm.pretrain import (
-    build_audio_pretrain_pipeline,
+    build_audio_no_speaker_cut_pipeline,
     finalize_audio_pretrain_outputs,
     prepare_audio_pretrain_outputs,
 )
 
 _EXECUTOR_FACTORIES = {
-    "xenna": "nemo_curator.backends.xenna.executor:XennaExecutor",
-    "ray_data": "nemo_curator.backends.ray_data.executor:RayDataExecutor",
+    "xenna": XennaExecutor,
+    "ray_data": RayDataExecutor,
 }
 
 
@@ -62,35 +41,36 @@ def _create_executor(backend: str, **kwargs: object) -> object:
     if backend not in _EXECUTOR_FACTORIES:
         msg = f"Unknown backend {backend!r}; choose from {list(_EXECUTOR_FACTORIES)}"
         raise ValueError(msg)
-    module_path, class_name = _EXECUTOR_FACTORIES[backend].rsplit(":", 1)
-    return getattr(importlib.import_module(module_path), class_name)(**kwargs)
+    return _EXECUTOR_FACTORIES[backend](**kwargs)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Cut long-form diarized audio into snippets for ALM pretraining.",
+        description=(
+            "Cut diarized long-form audio into speech snippets by using "
+            "no-speaker segments as hard boundaries."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--input-manifest", required=True, help="Path to input JSONL manifest")
+    parser.add_argument(
+        "--input-manifest",
+        "--input-manifests",
+        "--input-manifes",
+        dest="input_manifest",
+        required=True,
+        help="Path to input JSONL manifest",
+    )
     parser.add_argument("--audio-dir", required=True, help="Directory containing source audio files")
     parser.add_argument(
         "--output-dir",
         required=True,
-        help=(
-            "Directory for pipeline outputs (typically the parent of the "
-            "manifest, tar, and metrics paths)."
-        ),
+        help="Directory for pipeline outputs",
     )
-    parser.add_argument("--output-manifest", required=True, help="Path to output JSONL manifest (one row per snippet)")
+    parser.add_argument("--output-manifest", required=True, help="Path to output JSONL manifest")
     parser.add_argument(
         "--output-audio-tar-path",
         required=True,
-        help=(
-            "Path to the output audio tar archive containing one member per "
-            "snippet (named '<snippet_id>.<output-format>'). Members are at "
-            "the tar root, sorted lexicographically (WebDataset/Energon "
-            "compatible)."
-        ),
+        help="Path to output tar archive containing one audio member per snippet",
     )
     parser.add_argument("--metrics-path", required=True, help="Path to metrics summary JSON")
     parser.add_argument("--max-duration-sec", type=float, required=True, help="Maximum snippet duration in seconds")
@@ -98,62 +78,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--min-duration-sec", type=float, default=0.5, help="Minimum snippet duration in seconds (default 0.5)"
     )
     parser.add_argument(
-        "--min-overlap-sec",
-        type=float,
-        default=0.5,
-        help="Minimum intersection (sec) for two segments to be considered overlapping (default 0.5)",
-    )
-    parser.add_argument(
-        "--max-segment-gap-in-snippet",
-        type=float,
-        default=30.0,
-        help=(
-            "Maximum silence (sec) allowed between adjacent segments inside "
-            "the same snippet; larger gaps force a new snippet. Default 30s "
-            "treats long silences as conversation boundaries (topic change, "
-            "ad break, recording boundary) and avoids bridging them."
-        ),
-    )
-    parser.add_argument(
-        "--tokenizer-path",
-        required=True,
-        help=(
-            "Either a local directory containing a HuggingFace fast tokenizer "
-            "(loadable via AutoTokenizer.from_pretrained) or a HuggingFace Hub "
-            "repository id (e.g. 'openai/whisper-large-v3'); used by the snippet "
-            "repetition filter to detect Whisper-style looping hallucinations. "
-            "Repo ids are fetched once per node in setup_on_node."
-        ),
-    )
-    parser.add_argument(
-        "--tokenizer-cache-dir",
-        default=None,
-        help=(
-            "Optional cache directory for HuggingFace downloads (passed to "
-            "snapshot_download / AutoTokenizer.from_pretrained); default uses "
-            "the standard HF cache (~/.cache/huggingface/hub)."
-        ),
-    )
-    parser.add_argument(
-        "--hf-token",
-        default=None,
-        help=(
-            "Optional HuggingFace token for gated tokenizer repositories; "
-            "default uses the ambient HF auth state (HF_TOKEN env / "
-            "huggingface-cli login)."
-        ),
-    )
-    parser.add_argument(
-        "--ngram-n", type=int, default=10, help="N-gram size for the repetition filter (default 10)"
-    )
-    parser.add_argument(
-        "--ngram-max-count",
+        "--min-num-speaker",
         type=int,
-        default=3,
-        help=(
-            "Drop a snippet if any token-id n-gram in its joined text appears "
-            "strictly more than this many times (default 3)"
-        ),
+        default=1,
+        help="Minimum unique speaker labels required in an emitted snippet (default 1)",
+    )
+    parser.add_argument(
+        "--max-num-speaker",
+        type=int,
+        default=None,
+        help="Maximum unique speaker labels allowed in an emitted snippet (default disabled)",
     )
     parser.add_argument(
         "--target-sample-rate", type=int, default=16000, help="Output snippet sample rate (default 16000)"
@@ -169,11 +103,9 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["basename", "relative", "as_is"],
         default="basename",
         help=(
-            "How the reader maps each row's 'audio_filepath' to an on-disk "
-            "path: 'basename' (default; audio_dir/basename(value), also "
-            "rejects manifests with duplicate basenames), 'relative' "
-            "(audio_dir/value; preserves subdirectories) or 'as_is' (trust "
-            "the manifest's value)."
+            "How the reader maps each row's audio path to disk: "
+            "'basename' (audio_dir/basename(value)), 'relative' "
+            "(audio_dir/value), or 'as_is' (trust manifest value)."
         ),
     )
     parser.add_argument("--dataset-name", default="long_form_audio", help="Tag attached to emitted AudioTasks")
@@ -192,11 +124,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help=(
-            "Skip audio I/O entirely -- no snippet audio files are written -- "
-            "but still produce the snippet manifest and metrics summary. "
-            "Useful for sizing up a real dataset before committing to a full run."
-        ),
+        help="Skip audio I/O and produce only the manifest and metrics summary",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     return parser
@@ -217,7 +145,7 @@ def main() -> None:
         if path:
             os.makedirs(path, exist_ok=True)
 
-    pipeline = build_audio_pretrain_pipeline(
+    pipeline = build_audio_no_speaker_cut_pipeline(
         input_manifest=args.input_manifest,
         audio_dir=args.audio_dir,
         output_dir=args.output_dir,
@@ -225,14 +153,9 @@ def main() -> None:
         output_audio_tar_path=args.output_audio_tar_path,
         metrics_path=args.metrics_path,
         max_duration_sec=args.max_duration_sec,
-        tokenizer_path=args.tokenizer_path,
         min_duration_sec=args.min_duration_sec,
-        min_overlap_sec=args.min_overlap_sec,
-        max_segment_gap_in_snippet=args.max_segment_gap_in_snippet,
-        ngram_n=args.ngram_n,
-        ngram_max_count=args.ngram_max_count,
-        tokenizer_cache_dir=args.tokenizer_cache_dir,
-        hf_token=args.hf_token,
+        min_num_speaker=args.min_num_speaker,
+        max_num_speaker=args.max_num_speaker,
         target_sample_rate=args.target_sample_rate,
         output_format=args.output_format,
         audio_filepath_key=args.audio_filepath_key,
@@ -255,10 +178,6 @@ def main() -> None:
     try:
         pipeline.run(executor)
     finally:
-        # Always merge whatever shards the writer + aggregator managed to produce,
-        # even on pipeline failure (OOM, network partition, Ctrl+C, stage exception).
-        # Without this, partial shards would be silently deleted by the next
-        # prepare_audio_pretrain_outputs call and any partial output is lost.
         elapsed = time.monotonic() - t0
         finalize_audio_pretrain_outputs(args.output_manifest, args.metrics_path, args.output_audio_tar_path)
     logger.info(

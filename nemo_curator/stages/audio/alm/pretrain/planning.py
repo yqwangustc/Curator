@@ -144,9 +144,15 @@ def _finalize_snippet_candidates(
     candidates: list[dict],
     max_duration_sec: float,
     min_duration_sec: float,
+    min_num_speaker: int | None = None,
+    max_num_speaker: int | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """Apply shared duration/text filters to snippet candidates."""
     drop_counts = {"too_long": 0, "too_short": 0, "no_text": 0}
+    if min_num_speaker is not None:
+        drop_counts["too_few_speakers"] = 0
+    if max_num_speaker is not None:
+        drop_counts["too_many_speakers"] = 0
     snippets: list[dict] = []
     for cand in candidates:
         duration = cand["end"] - cand["start"]
@@ -155,6 +161,13 @@ def _finalize_snippet_candidates(
             continue
         if duration < min_duration_sec:
             drop_counts["too_short"] += 1
+            continue
+        num_speakers = unique_speaker_count(cand["segments"])
+        if min_num_speaker is not None and num_speakers < min_num_speaker:
+            drop_counts["too_few_speakers"] += 1
+            continue
+        if max_num_speaker is not None and num_speakers > max_num_speaker:
+            drop_counts["too_many_speakers"] += 1
             continue
         text = " ".join(_segment_text(s) for s in cand["segments"]).strip()
         if not text:
@@ -251,11 +264,35 @@ def is_no_speaker_segment(
     return is_no_speaker_label(segment.get("speaker"), no_speaker_labels)
 
 
-def plan_no_speaker_snippets(
+def unique_speaker_count(segments: list[dict]) -> int:
+    """Count non-empty unique speaker labels in ``segments``."""
+    speakers = {
+        str(seg.get("speaker")).strip()
+        for seg in segments
+        if str(seg.get("speaker") or "").strip()
+    }
+    return len(speakers)
+
+
+def _validate_speaker_count_bounds(min_num_speaker: int, max_num_speaker: int | None) -> None:
+    if min_num_speaker < 0:
+        msg = "min_num_speaker must be >= 0"
+        raise ValueError(msg)
+    if max_num_speaker is not None and max_num_speaker < 0:
+        msg = "max_num_speaker must be >= 0"
+        raise ValueError(msg)
+    if max_num_speaker is not None and min_num_speaker > max_num_speaker:
+        msg = "min_num_speaker must be <= max_num_speaker"
+        raise ValueError(msg)
+
+
+def plan_no_speaker_snippets(  # noqa: PLR0913
     segments: list[dict],
     max_duration_sec: float,
     min_duration_sec: float,
     no_speaker_labels: tuple[str, ...] = DEFAULT_NO_SPEAKER_LABELS,
+    min_num_speaker: int = 1,
+    max_num_speaker: int | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """Pack consecutive non-no-speaker segments into snippets.
 
@@ -263,12 +300,23 @@ def plan_no_speaker_snippets(
     the current snippet and is never included in output. Consecutive
     non-no-speaker segments are grouped until either a no-speaker segment
     is seen or adding the next segment would exceed ``max_duration_sec``.
+    Candidate snippets with fewer than ``min_num_speaker`` unique speaker
+    labels, or more than ``max_num_speaker`` when set, are dropped.
 
     Returns ``(snippets, drop_counts)`` where drop counts include
-    ``no_speaker`` plus the shared ``too_long``, ``too_short``, and
-    ``no_text`` filters.
+    ``no_speaker``, ``too_few_speakers``, ``too_many_speakers``, plus the
+    shared ``too_long``, ``too_short``, and ``no_text`` filters.
     """
-    drop_counts = {"no_speaker": 0, "too_long": 0, "too_short": 0, "no_text": 0}
+    _validate_speaker_count_bounds(min_num_speaker, max_num_speaker)
+
+    drop_counts = {
+        "no_speaker": 0,
+        "too_long": 0,
+        "too_short": 0,
+        "no_text": 0,
+        "too_few_speakers": 0,
+        "too_many_speakers": 0,
+    }
     if not segments:
         return [], drop_counts
 
@@ -297,7 +345,13 @@ def plan_no_speaker_snippets(
     if cur is not None:
         candidates.append(cur)
 
-    snippets, shared_drops = _finalize_snippet_candidates(candidates, max_duration_sec, min_duration_sec)
+    snippets, shared_drops = _finalize_snippet_candidates(
+        candidates,
+        max_duration_sec,
+        min_duration_sec,
+        min_num_speaker=min_num_speaker,
+        max_num_speaker=max_num_speaker,
+    )
     drop_counts.update(shared_drops)
     return snippets, drop_counts
 
@@ -585,6 +639,8 @@ class NoSpeakerCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
     max_duration_sec: float = 600.0
     min_duration_sec: float = 0.5
     no_speaker_labels: tuple[str, ...] = DEFAULT_NO_SPEAKER_LABELS
+    min_num_speaker: int = 1
+    max_num_speaker: int | None = None
 
     name: str = "NoSpeakerCutPlanner"
     batch_size: int = 1
@@ -603,6 +659,7 @@ class NoSpeakerCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
         if not self.no_speaker_labels:
             msg = "no_speaker_labels must not be empty"
             raise ValueError(msg)
+        _validate_speaker_count_bounds(self.min_num_speaker, self.max_num_speaker)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], ["segments"]
@@ -623,6 +680,8 @@ class NoSpeakerCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
             self.max_duration_sec,
             self.min_duration_sec,
             self.no_speaker_labels,
+            self.min_num_speaker,
+            self.max_num_speaker,
         )
         task.data[_PLAN_DATA_KEY] = snippets
 
@@ -635,6 +694,8 @@ class NoSpeakerCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
         meta["dropped_too_long"] = drop_counts["too_long"]
         meta["dropped_too_short"] = drop_counts["too_short"]
         meta["dropped_no_text"] = drop_counts["no_text"]
+        meta["dropped_too_few_speakers"] = drop_counts["too_few_speakers"]
+        meta["dropped_too_many_speakers"] = drop_counts["too_many_speakers"]
         meta["dropped_repetition"] = 0
         meta["kept_after_filter_count"] = original_count - drop_counts["no_speaker"]
         meta["planned_snippets"] = len(snippets)
@@ -648,6 +709,8 @@ class NoSpeakerCutPlannerStage(ProcessingStage[AudioTask, AudioTask]):
                 "dropped_too_long": float(drop_counts["too_long"]),
                 "dropped_too_short": float(drop_counts["too_short"]),
                 "dropped_no_text": float(drop_counts["no_text"]),
+                "dropped_too_few_speakers": float(drop_counts["too_few_speakers"]),
+                "dropped_too_many_speakers": float(drop_counts["too_many_speakers"]),
             }
         )
         if not snippets:

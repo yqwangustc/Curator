@@ -90,7 +90,7 @@ class SnippetExtractionStage(ProcessingStage[AudioTask, AudioTask]):
     """
 
     output_dir: str
-    output_audio_tar_path: str
+    output_audio_tar_path: str = ""
     target_sample_rate: int = 16000
     output_format: str = "flac"
     audio_filepath_key: str = "audio_filepath"
@@ -106,6 +106,9 @@ class SnippetExtractionStage(ProcessingStage[AudioTask, AudioTask]):
             raise ValueError(msg)
         if self.target_sample_rate <= 0:
             msg = "target_sample_rate must be > 0"
+            raise ValueError(msg)
+        if not self.dry_run and not self.output_audio_tar_path:
+            msg = "output_audio_tar_path must be non-empty when dry_run is False"
             raise ValueError(msg)
         self._tar_shard_path: str | None = None
         self._tar: Any = None  # tarfile.TarFile, opened lazily in setup()

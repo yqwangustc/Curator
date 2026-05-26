@@ -107,6 +107,14 @@ class ReadLongFormManifestStage(ProcessingStage[_EmptyTask, AudioTask]):
     batch_size: int = 1
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
+    def __post_init__(self) -> None:
+        if not self.input_manifest:
+            msg = "input_manifest must be non-empty"
+            raise ValueError(msg)
+        if not self.audio_dir:
+            msg = "audio_dir must be non-empty"
+            raise ValueError(msg)
+
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
 
@@ -350,6 +358,10 @@ class PretrainMetricsAggregatorStage(ProcessingStage[AudioTask, AudioTask]):
         }
         if "dropped_no_speaker" in meta:
             dropped["no_speaker"] = int(meta.get("dropped_no_speaker", 0))
+        if "dropped_too_few_speakers" in meta:
+            dropped["too_few_speakers"] = int(meta.get("dropped_too_few_speakers", 0))
+        if "dropped_too_many_speakers" in meta:
+            dropped["too_many_speakers"] = int(meta.get("dropped_too_many_speakers", 0))
         record: dict[str, Any] = {
             "id": original_id,
             "in_segments": int(meta.get("original_seg_count", 0)),

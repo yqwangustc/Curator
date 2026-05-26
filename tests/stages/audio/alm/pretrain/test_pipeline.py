@@ -342,7 +342,6 @@ class TestPipelineEndToEndTarMode:
     def test_full_pipeline_writes_merged_tar_with_expected_members(self, tmp_path: Path) -> None:
         pytest.importorskip("transformers")
         pytest.importorskip("tokenizers")
-        pytest.importorskip("torchaudio")
 
         audio_dir = tmp_path / "audios"
         audio_dir.mkdir()

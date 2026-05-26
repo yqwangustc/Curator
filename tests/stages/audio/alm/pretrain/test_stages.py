@@ -37,7 +37,7 @@ from nemo_curator.stages.audio.alm.pretrain import (
     finalize_audio_pretrain_outputs,
     prepare_audio_pretrain_outputs,
 )
-from nemo_curator.stages.audio.alm.pretrain.stages import (
+from nemo_curator.stages.audio.alm.pretrain.utils import (
     _PLAN_DATA_KEY,
     _PRETRAIN_META_KEY,
     _make_shard_path,
@@ -206,8 +206,8 @@ class TestSnippetExtractionStageDryRun:
 
         s0 = out[0].data
         # Snippet ID + path pattern
-        assert s0["snippet_id"] == "X_0.000_5.000"
-        assert s0["audio_filepath"].endswith("X_0.000_5.000.flac")
+        assert s0["snippet_id"] == "X-0_000-5_000"
+        assert s0["audio_filepath"].endswith("X-0_000-5_000.flac")
         assert s0["duration"] == pytest.approx(5.0)
         # Field cleanup
         assert "alignment" not in s0
@@ -217,8 +217,8 @@ class TestSnippetExtractionStageDryRun:
         assert s0["audio_num_channels"] == 1
         assert s0["actual_duration"] == pytest.approx(5.0)
         assert s0["proposed_duration"] == pytest.approx(5.0)
-        # Top-level text recomputed (uses text_ITN -> "Hi.")
-        assert s0["text"] == "Hi."
+        # Top-level text recomputed from segment text.
+        assert s0["text"] == "hi"
         # Segments relativized
         assert s0["segments"][0]["start"] == pytest.approx(0.0)
 

@@ -81,7 +81,14 @@ class TestPlanNoSpeakerSnippets:
         snippets, drops = plan_no_speaker_snippets(segments, max_duration_sec=8.0, min_duration_sec=0.5)
 
         assert [(s["start"], s["end"]) for s in snippets] == [(0.0, 8.0), (8.0, 12.0)]
-        assert drops == {"no_speaker": 0, "too_long": 0, "too_short": 0, "no_text": 0}
+        assert drops == {
+            "no_speaker": 0,
+            "too_long": 0,
+            "too_short": 0,
+            "no_text": 0,
+            "too_few_speakers": 0,
+            "too_many_speakers": 0,
+        }
 
     def test_applies_shared_duration_and_text_drops(self) -> None:
         segments = [
@@ -92,7 +99,39 @@ class TestPlanNoSpeakerSnippets:
         snippets, drops = plan_no_speaker_snippets(segments, max_duration_sec=5.0, min_duration_sec=0.5)
 
         assert snippets == []
-        assert drops == {"no_speaker": 0, "too_long": 1, "too_short": 1, "no_text": 1}
+        assert drops == {
+            "no_speaker": 0,
+            "too_long": 1,
+            "too_short": 1,
+            "no_text": 1,
+            "too_few_speakers": 0,
+            "too_many_speakers": 0,
+        }
+
+    def test_applies_speaker_count_drops(self) -> None:
+        segments = [
+            _seg(0.0, 1.0, "A", "one speaker"),
+            _seg(1.0, 1.2, "no-speaker", ""),
+            _seg(2.0, 3.0, "A", "two"),
+            _seg(3.0, 4.0, "B", "speakers"),
+            _seg(4.0, 4.2, "no-speaker", ""),
+            _seg(5.0, 6.0, "A", "three"),
+            _seg(6.0, 7.0, "B", "speakers"),
+            _seg(7.0, 8.0, "C", "here"),
+        ]
+
+        snippets, drops = plan_no_speaker_snippets(
+            segments,
+            max_duration_sec=10.0,
+            min_duration_sec=0.5,
+            min_num_speaker=2,
+            max_num_speaker=2,
+        )
+
+        assert [(s["start"], s["end"]) for s in snippets] == [(2.0, 4.0)]
+        assert [[seg["speaker"] for seg in s["segments"]] for s in snippets] == [["A", "B"]]
+        assert drops["too_few_speakers"] == 1
+        assert drops["too_many_speakers"] == 1
 
 
 class TestNoSpeakerCutPlannerStage:
@@ -117,6 +156,8 @@ class TestNoSpeakerCutPlannerStage:
         meta = out._metadata[_PRETRAIN_META_KEY]
         assert meta["original_seg_count"] == 3
         assert meta["dropped_no_speaker"] == 1
+        assert meta["dropped_too_few_speakers"] == 0
+        assert meta["dropped_too_many_speakers"] == 0
         assert meta["planned_snippets"] == 1
 
     def test_invalid_args_rejected(self) -> None:
@@ -128,6 +169,12 @@ class TestNoSpeakerCutPlannerStage:
             NoSpeakerCutPlannerStage(max_duration_sec=5.0, min_duration_sec=10.0)
         with pytest.raises(ValueError, match="no_speaker_labels"):
             NoSpeakerCutPlannerStage(no_speaker_labels=())
+        with pytest.raises(ValueError, match="min_num_speaker"):
+            NoSpeakerCutPlannerStage(min_num_speaker=-1)
+        with pytest.raises(ValueError, match="max_num_speaker"):
+            NoSpeakerCutPlannerStage(max_num_speaker=-1)
+        with pytest.raises(ValueError, match="min_num_speaker must be <="):
+            NoSpeakerCutPlannerStage(min_num_speaker=3, max_num_speaker=2)
 
 
 class TestNoSpeakerCutPipeline:
@@ -172,6 +219,8 @@ class TestNoSpeakerCutPipeline:
             SnippetManifestWriterStage,
             PretrainMetricsAggregatorStage,
         )
+        assert pipeline.stages[1].min_num_speaker == 1
+        assert pipeline.stages[1].max_num_speaker is None
 
         reader, planner, extractor, writer, aggregator = pipeline.stages
         prepare_audio_pretrain_outputs(str(output_manifest), str(metrics_path), str(output_audio_tar))
@@ -200,3 +249,24 @@ class TestNoSpeakerCutPipeline:
         assert summary["num_input_audios"] == 1
         assert summary["num_output_snippets"] == 2
         assert summary["dropped"]["no_speaker"] == 2
+        assert summary["dropped"]["too_few_speakers"] == 0
+        assert summary["dropped"]["too_many_speakers"] == 0
+
+    def test_builder_passes_speaker_count_bounds(self, tmp_path: Path) -> None:
+        pipeline = build_audio_no_speaker_cut_pipeline(
+            input_manifest=str(tmp_path / "in.jsonl"),
+            audio_dir=str(tmp_path / "audios"),
+            output_dir=str(tmp_path / "snippets"),
+            output_manifest_path=str(tmp_path / "snippets.jsonl"),
+            output_audio_tar_path=str(tmp_path / "snippets.tar"),
+            metrics_path=str(tmp_path / "metrics.json"),
+            max_duration_sec=30.0,
+            min_num_speaker=2,
+            max_num_speaker=4,
+            dry_run=True,
+        )
+
+        planner = pipeline.stages[1]
+        assert isinstance(planner, NoSpeakerCutPlannerStage)
+        assert planner.min_num_speaker == 2
+        assert planner.max_num_speaker == 4

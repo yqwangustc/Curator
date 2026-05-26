@@ -43,7 +43,7 @@ from nemo_curator.stages.audio.alm.pretrain.utils import (
 
 
 def prepare_audio_pretrain_outputs(
-    output_manifest_path: str, metrics_path: str, output_audio_tar_path: str
+    output_manifest_path: str, metrics_path: str, output_audio_tar_path: str | None = None
 ) -> None:
     """Delete any pre-existing shards from prior runs.
 
@@ -53,7 +53,7 @@ def prepare_audio_pretrain_outputs(
     """
     n_man = _delete_shards(output_manifest_path, _MANIFEST_SHARD_EXT)
     n_met = _delete_shards(metrics_path, _METRICS_SHARD_EXT)
-    n_tar = _delete_shards(output_audio_tar_path, _TAR_SHARD_EXT)
+    n_tar = _delete_shards(output_audio_tar_path, _TAR_SHARD_EXT) if output_audio_tar_path else 0
     if n_man or n_met or n_tar:
         logger.info(
             f"prepare_audio_pretrain_outputs: removed {n_man} stale manifest "
@@ -63,7 +63,7 @@ def prepare_audio_pretrain_outputs(
 
 
 def finalize_audio_pretrain_outputs(
-    output_manifest_path: str, metrics_path: str, output_audio_tar_path: str
+    output_manifest_path: str, metrics_path: str, output_audio_tar_path: str | None = None
 ) -> None:
     """Merge per-worker shards into the final manifest, metrics JSON, and audio tar.
 
@@ -95,6 +95,8 @@ def finalize_audio_pretrain_outputs(
     """
     _merge_manifest_shards(output_manifest_path)
     _merge_metrics_shards(metrics_path)
+    if not output_audio_tar_path:
+        return
     _merge_tar_shards(output_audio_tar_path)
     dropped_missing, dropped_unreadable = _reconcile_manifest_with_tar(
         output_manifest_path, output_audio_tar_path
@@ -421,7 +423,7 @@ def _reconcile_manifest_with_tar(  # noqa: C901, PLR0915
     return (dropped_missing, dropped_unreadable)
 
 
-def _patch_metrics_post_reconcile(  # noqa: C901, PLR0912
+def _patch_metrics_post_reconcile(  # noqa: C901, PLR0915
     metrics_path: str,
     manifest_path: str,
     dropped_missing: int,
